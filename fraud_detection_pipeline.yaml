@@ -1,0 +1,243 @@
+# PIPELINE DEFINITION
+# Name: fraud-detection-pipeline
+components:
+  comp-download-and-split-data:
+    executorLabel: exec-download-and-split-data
+    outputDefinitions:
+      artifacts:
+        output_test:
+          artifactType:
+            schemaTitle: system.Artifact
+            schemaVersion: 0.0.1
+        output_train:
+          artifactType:
+            schemaTitle: system.Artifact
+            schemaVersion: 0.0.1
+        output_val:
+          artifactType:
+            schemaTitle: system.Artifact
+            schemaVersion: 0.0.1
+  comp-train-model:
+    executorLabel: exec-train-model
+    inputDefinitions:
+      artifacts:
+        train_data:
+          artifactType:
+            schemaTitle: system.Artifact
+            schemaVersion: 0.0.1
+        val_data:
+          artifactType:
+            schemaTitle: system.Artifact
+            schemaVersion: 0.0.1
+    outputDefinitions:
+      artifacts:
+        model_output:
+          artifactType:
+            schemaTitle: system.Artifact
+            schemaVersion: 0.0.1
+  comp-upload-to-s3:
+    executorLabel: exec-upload-to-s3
+    inputDefinitions:
+      artifacts:
+        model_path:
+          artifactType:
+            schemaTitle: system.Artifact
+            schemaVersion: 0.0.1
+deploymentSpec:
+  executors:
+    exec-download-and-split-data:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - download_and_split_data
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.7.0'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"'  &&\
+          \  python3 -m pip install --quiet --no-warn-script-location 'kagglehub'\
+          \ 'pandas' 'scikit-learn' && \"$0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef download_and_split_data(output_train: OutputPath(), output_val:\
+          \ OutputPath(), output_test: OutputPath()):\n    import kagglehub\n    import\
+          \ pandas as pd\n    from sklearn.model_selection import train_test_split\n\
+          \n    path = kagglehub.dataset_download(\"nelgiriyewithana/credit-card-fraud-detection-dataset-2023\"\
+          )\n    df = pd.read_csv(f\"{path}/creditcard_2023.csv\")\n\n    train_df,\
+          \ temp_df = train_test_split(df, train_size=0.6, random_state=42)\n    val_df,\
+          \ test_df = train_test_split(temp_df, train_size=0.5, random_state=42)\n\
+          \n    train_df.to_csv(output_train, index=False)\n    val_df.to_csv(output_val,\
+          \ index=False)\n    test_df.to_csv(output_test, index=False)\n\n"
+        image: python:3.9
+    exec-train-model:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - train_model
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.7.0'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"'  &&\
+          \  python3 -m pip install --quiet --no-warn-script-location 'tensorflow'\
+          \ 'scikit-learn' 'pandas' 'onnx' 'onnxruntime' 'tf2onnx' && \"$0\" \"$@\"\
+          \n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef train_model(train_data: InputPath(), val_data: InputPath(), model_output:\
+          \ OutputPath()):\n    import pandas as pd\n    import tensorflow as tf\n\
+          \    import numpy as np\n    from sklearn.preprocessing import StandardScaler\n\
+          \    import tf2onnx\n    import onnx\n\n    df_train = pd.read_csv(train_data)\n\
+          \    df_val = pd.read_csv(val_data)\n\n    X_train = df_train.drop(['Class',\
+          \ 'id'], axis=1)\n    y_train = df_train['Class']\n    X_val = df_val.drop(['Class',\
+          \ 'id'], axis=1)\n    y_val = df_val['Class']\n\n    scaler = StandardScaler()\n\
+          \    X_train = scaler.fit_transform(X_train)\n    X_val = scaler.transform(X_val)\n\
+          \n    model = tf.keras.Sequential([\n        tf.keras.layers.Dense(64, activation='relu',\
+          \ input_shape=(29,)),\n        tf.keras.layers.Dropout(0.3),\n        tf.keras.layers.Dense(32,\
+          \ activation='relu'),\n        tf.keras.layers.Dropout(0.2),\n        tf.keras.layers.Dense(16,\
+          \ activation='relu'),\n        tf.keras.layers.Dense(1, activation='sigmoid')\n\
+          \    ])\n\n    model.compile(optimizer='adam', loss='binary_crossentropy',\
+          \ metrics=['accuracy'])\n\n    class_weights = {0: 1, 1: len(y_train[y_train==0])/len(y_train[y_train==1])}\n\
+          \n    model.fit(X_train, y_train, epochs=3, validation_data=(X_val, y_val),\
+          \ class_weight=class_weights)\n\n    # # Before conversion, set the output\
+          \ names\n    # model.outputs[0]._name = 'output_name'  # Give your output\
+          \ a unique name\n\n    # model_proto, _ = tf2onnx.convert.from_keras(model)\n\
+          \    # Convert the Keras model to ONNX\n    import tensorflow as tf\n  \
+          \  import tf2onnx\n    import onnx\n    import os\n\n    # Wrap the model\
+          \ in a tf.function\n    @tf.function(input_signature=[tf.TensorSpec([None,\
+          \ X_train.shape[1]], tf.float32, name='dense_input')])\n    def model_fn(x):\n\
+          \        return model(x)\n\n    # Convert the Keras model to ONNX\n    model_proto,\
+          \ external_tensor_storage = tf2onnx.convert.from_function(\n        model_fn,\n\
+          \        input_signature=[tf.TensorSpec([None, X_train.shape[1]], tf.float32,\
+          \ name='dense_input')],\n        opset=13  # You can specify the ONNX opset\
+          \ version here\n    )\n\n    onnx.save(model_proto, model_output)\n\n"
+        image: python:3.9
+    exec-upload-to-s3:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - upload_to_s3
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.7.0'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"'  &&\
+          \  python3 -m pip install --quiet --no-warn-script-location 'boto3' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef upload_to_s3(model_path: InputPath()):\n    import boto3\n  \
+          \  import os\n\n    s3_client = boto3.client(\n        's3',\n        aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),\n\
+          \        aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),\n   \
+          \     endpoint_url=os.getenv('AWS_S3_ENDPOINT')\n    )\n\n    s3_client.upload_file(model_path,\
+          \ os.getenv('AWS_S3_BUCKET'), 'models/fraud/1/model.onnx')\n\n"
+        env:
+        - name: S3_KEY
+          value: models/fraud/1/model.onnx
+        image: python:3.9
+pipelineInfo:
+  name: fraud-detection-pipeline
+root:
+  dag:
+    tasks:
+      download-and-split-data:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-download-and-split-data
+        taskInfo:
+          name: download-and-split-data
+      train-model:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-train-model
+        dependentTasks:
+        - download-and-split-data
+        inputs:
+          artifacts:
+            train_data:
+              taskOutputArtifact:
+                outputArtifactKey: output_train
+                producerTask: download-and-split-data
+            val_data:
+              taskOutputArtifact:
+                outputArtifactKey: output_val
+                producerTask: download-and-split-data
+        taskInfo:
+          name: train-model
+      upload-to-s3:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-upload-to-s3
+        dependentTasks:
+        - train-model
+        inputs:
+          artifacts:
+            model_path:
+              taskOutputArtifact:
+                outputArtifactKey: model_output
+                producerTask: train-model
+        taskInfo:
+          name: upload-to-s3
+schemaVersion: 2.1.0
+sdkVersion: kfp-2.7.0
+---
+platforms:
+  kubernetes:
+    deploymentSpec:
+      executors:
+        exec-upload-to-s3:
+          secretAsEnv:
+          - keyToEnv:
+            - envVar: AWS_ACCESS_KEY_ID
+              secretKey: AWS_ACCESS_KEY_ID
+            - envVar: AWS_SECRET_ACCESS_KEY
+              secretKey: AWS_SECRET_ACCESS_KEY
+            - envVar: AWS_DEFAULT_REGION
+              secretKey: AWS_DEFAULT_REGION
+            - envVar: AWS_S3_BUCKET
+              secretKey: AWS_S3_BUCKET
+            - envVar: AWS_S3_ENDPOINT
+              secretKey: AWS_S3_ENDPOINT
+            secretName: aws-connection-my-storage
