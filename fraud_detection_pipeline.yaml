@@ -35,14 +35,25 @@ components:
           artifactType:
             schemaTitle: system.Artifact
             schemaVersion: 0.0.1
-  comp-upload-to-s3:
-    executorLabel: exec-upload-to-s3
+  comp-upload-to-minio:
+    executorLabel: exec-upload-to-minio
     inputDefinitions:
       artifacts:
         model_path:
           artifactType:
             schemaTitle: system.Artifact
             schemaVersion: 0.0.1
+      parameters:
+        minio_access_key:
+          parameterType: STRING
+        minio_endpoint:
+          parameterType: STRING
+        minio_secret_key:
+          parameterType: STRING
+    outputDefinitions:
+      parameters:
+        Output:
+          parameterType: STRING
 deploymentSpec:
   executors:
     exec-download-and-split-data:
@@ -138,13 +149,13 @@ deploymentSpec:
           \ name='dense_input')],\n        opset=13  # You can specify the ONNX opset\
           \ version here\n    )\n\n    onnx.save(model_proto, model_output)\n\n"
         image: python:3.9
-    exec-upload-to-s3:
+    exec-upload-to-minio:
       container:
         args:
         - --executor_input
         - '{{$}}'
         - --function_to_execute
-        - upload_to_s3
+        - upload_to_minio
         command:
         - sh
         - -c
@@ -165,14 +176,21 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef upload_to_s3(model_path: InputPath()):\n    import boto3\n  \
-          \  import os\n\n    s3_client = boto3.client(\n        's3',\n        aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),\n\
-          \        aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),\n   \
-          \     endpoint_url=os.getenv('AWS_S3_ENDPOINT')\n    )\n\n    s3_client.upload_file(model_path,\
-          \ os.getenv('AWS_S3_BUCKET'), 'models/fraud/1/model.onnx')\n\n"
-        env:
-        - name: S3_KEY
-          value: models/fraud/1/model.onnx
+          \ *\n\ndef upload_to_minio(\n    model_path: InputPath(),\n    minio_endpoint:\
+          \ str,\n    minio_access_key: str,\n    minio_secret_key: str\n) -> str:\
+          \  # Change to return string instead of using Output parameter\n    import\
+          \ boto3\n    import os\n    from botocore.client import Config\n\n    #\
+          \ Clean the endpoint URL\n    minio_endpoint = minio_endpoint.strip()\n\n\
+          \    # Create S3 client with explicit credentials\n    s3_client = boto3.client(\n\
+          \        's3',\n        endpoint_url=minio_endpoint,\n        aws_access_key_id=minio_access_key,\n\
+          \        aws_secret_access_key=minio_secret_key,\n        config=Config(\n\
+          \            signature_version='s3v4',\n            s3={'addressing_style':\
+          \ 'path'}\n        )\n    )\n\n    bucket_name = 'mlflow'  # Or your bucket\
+          \ name\n    object_name = 'models/fraud/1/model.onnx'\n\n    print(f\"Uploading\
+          \ {model_path} to {bucket_name}/{object_name}\")\n\n    # Upload the file\n\
+          \    s3_client.upload_file(\n        Filename=model_path,\n        Bucket=bucket_name,\n\
+          \        Key=object_name\n    )\n\n    # Return the MinIO URL\n    return\
+          \ f\"{minio_endpoint}/{bucket_name}/{object_name}\"\n\n"
         image: python:3.9
 pipelineInfo:
   name: fraud-detection-pipeline
@@ -205,11 +223,11 @@ root:
                 producerTask: download-and-split-data
         taskInfo:
           name: train-model
-      upload-to-s3:
+      upload-to-minio:
         cachingOptions:
           enableCache: true
         componentRef:
-          name: comp-upload-to-s3
+          name: comp-upload-to-minio
         dependentTasks:
         - train-model
         inputs:
@@ -218,26 +236,17 @@ root:
               taskOutputArtifact:
                 outputArtifactKey: model_output
                 producerTask: train-model
+          parameters:
+            minio_access_key:
+              runtimeValue:
+                constant: admin1234
+            minio_endpoint:
+              runtimeValue:
+                constant: http://minio.kubeflow.svc.cluster.local:9000
+            minio_secret_key:
+              runtimeValue:
+                constant: admin1234
         taskInfo:
-          name: upload-to-s3
+          name: upload-to-minio
 schemaVersion: 2.1.0
 sdkVersion: kfp-2.7.0
----
-platforms:
-  kubernetes:
-    deploymentSpec:
-      executors:
-        exec-upload-to-s3:
-          secretAsEnv:
-          - keyToEnv:
-            - envVar: AWS_ACCESS_KEY_ID
-              secretKey: AWS_ACCESS_KEY_ID
-            - envVar: AWS_SECRET_ACCESS_KEY
-              secretKey: AWS_SECRET_ACCESS_KEY
-            - envVar: AWS_DEFAULT_REGION
-              secretKey: AWS_DEFAULT_REGION
-            - envVar: AWS_S3_BUCKET
-              secretKey: AWS_S3_BUCKET
-            - envVar: AWS_S3_ENDPOINT
-              secretKey: AWS_S3_ENDPOINT
-            secretName: aws-connection-my-storage
