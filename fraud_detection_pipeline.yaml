@@ -1,6 +1,28 @@
 # PIPELINE DEFINITION
 # Name: fraud-detection-pipeline
+# Inputs:
+#    accuracy_threshold: float [Default: 0.9]
 components:
+  comp-deploy-model-kserve:
+    executorLabel: exec-deploy-model-kserve
+    inputDefinitions:
+      parameters:
+        aws_access_key_id:
+          parameterType: STRING
+        aws_secret_access_key:
+          parameterType: STRING
+        minio_endpoint:
+          parameterType: STRING
+        mlflow_tracking_uri:
+          parameterType: STRING
+        namespace:
+          defaultValue: admin
+          isOptional: true
+          parameterType: STRING
+    outputDefinitions:
+      parameters:
+        Output:
+          parameterType: STRING
   comp-download-and-split-data:
     executorLabel: exec-download-and-split-data
     outputDefinitions:
@@ -29,33 +51,117 @@ components:
           artifactType:
             schemaTitle: system.Artifact
             schemaVersion: 0.0.1
+      parameters:
+        aws_access_key_id:
+          parameterType: STRING
+        aws_secret_access_key:
+          parameterType: STRING
+        minio_endpoint:
+          parameterType: STRING
+        mlflow_tracking_uri:
+          parameterType: STRING
     outputDefinitions:
       artifacts:
         model_output:
           artifactType:
             schemaTitle: system.Artifact
             schemaVersion: 0.0.1
-  comp-upload-to-minio:
-    executorLabel: exec-upload-to-minio
-    inputDefinitions:
-      artifacts:
-        model_path:
-          artifactType:
-            schemaTitle: system.Artifact
-            schemaVersion: 0.0.1
-      parameters:
-        minio_access_key:
-          parameterType: STRING
-        minio_endpoint:
-          parameterType: STRING
-        minio_secret_key:
-          parameterType: STRING
-    outputDefinitions:
-      parameters:
-        Output:
-          parameterType: STRING
 deploymentSpec:
   executors:
+    exec-deploy-model-kserve:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - deploy_model_kserve
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.7.0'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"'  &&\
+          \  python3 -m pip install --quiet --no-warn-script-location 'mlflow==2.8.1'\
+          \ 'kserve' 'kubernetes==25.3.0' 'urllib3==1.26.18' && \"$0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef deploy_model_kserve(\n    mlflow_tracking_uri: str,\n    minio_endpoint:\
+          \ str,\n    aws_access_key_id: str,\n    aws_secret_access_key: str,\n \
+          \   namespace: str = \"admin\"\n) -> str:\n    import mlflow\n    import\
+          \ os\n    from kubernetes import client as k8s_client, config\n    import\
+          \ time\n\n    # Initialize Kubernetes client\n    config.load_incluster_config()\n\
+          \    k8s_api = k8s_client.CustomObjectsApi()\n\n    # Get the latest model\
+          \ version\n    mlflow.set_tracking_uri(mlflow_tracking_uri)\n    mlflow_client\
+          \ = mlflow.MlflowClient()\n    model_name = \"fraud_detection_model\"\n\
+          \    versions = mlflow_client.search_model_versions(f\"name='{model_name}'\"\
+          )\n    latest_version = sorted(versions, key=lambda x: x.creation_timestamp,\
+          \ reverse=True)[0]\n\n    # Create service name\n    service_name = f\"\
+          fraud-4-detection-{latest_version.version}\"\n\n    # Create InferenceService\n\
+          \    isvc = {\n        \"apiVersion\": \"serving.kserve.io/v1beta1\",\n\
+          \        \"kind\": \"InferenceService\",\n        \"metadata\": {\n    \
+          \        \"name\": service_name,\n            \"namespace\": namespace,\n\
+          \            \"annotations\": {\n                \"serving.kserve.io/s3-endpoint\"\
+          : minio_endpoint.replace(\"http://\", \"\"),\n                \"serving.kserve.io/s3-usehttps\"\
+          : \"0\",\n                \"serving.kserve.io/s3-credentials\": \"minio-secret\"\
+          ,\n                \"serving.kserve.io/storageInit\": \"true\",\n      \
+          \          \"sidecar.istio.io/inject\": \"true\"\n            }\n      \
+          \  },\n        \"spec\": {\n            \"predictor\": {\n             \
+          \   \"serviceAccountName\": \"kserve-controller-s3\",\n                \"\
+          model\": {\n                    \"modelFormat\": {\n                   \
+          \     \"name\": \"tensorflow\"\n                    },\n               \
+          \     \"storageUri\": f\"s3://mlflow/0/{latest_version.run_id}/artifacts/model\"\
+          ,\n\n                    \"resources\": {\n                        \"requests\"\
+          : {\n                            \"cpu\": \"100m\",\n                  \
+          \          \"memory\": \"1Gi\"\n                        },\n           \
+          \             \"limits\": {\n                            \"cpu\": \"1\"\
+          ,\n                            \"memory\": \"2Gi\"\n                   \
+          \     }\n                    }\n                }\n            }\n     \
+          \   }\n    }\n\n    try:\n        # Delete existing service if it exists\n\
+          \        try:\n            k8s_api.delete_namespaced_custom_object(\n  \
+          \              group=\"serving.kserve.io\",\n                version=\"\
+          v1beta1\",\n                namespace=namespace,\n                plural=\"\
+          inferenceservices\",\n                name=service_name\n            )\n\
+          \            print(f\"Deleted existing service {service_name}\")\n     \
+          \       time.sleep(10)\n        except k8s_client.rest.ApiException as e:\n\
+          \            if e.status != 404:\n                print(f\"Error deleting\
+          \ service: {str(e)}\")\n\n        # Create new service\n        response\
+          \ = k8s_api.create_namespaced_custom_object(\n            group=\"serving.kserve.io\"\
+          ,\n            version=\"v1beta1\",\n            namespace=namespace,\n\
+          \            plural=\"inferenceservices\",\n            body=isvc\n    \
+          \    )\n        print(f\"Created new service {service_name}\")\n\n     \
+          \   # Wait for the service to be ready\n        max_retries = 30\n     \
+          \   retry_interval = 10\n\n        for i in range(max_retries):\n      \
+          \      print(f\"Checking service status (attempt {i+1}/{max_retries})\"\
+          )\n            response = k8s_api.get_namespaced_custom_object(\n      \
+          \          group=\"serving.kserve.io\",\n                version=\"v1beta1\"\
+          ,\n                namespace=namespace,\n                plural=\"inferenceservices\"\
+          ,\n                name=service_name\n            )\n\n            print(f\"\
+          Service status: {response.get('status', {})}\")\n\n            if response.get('status',\
+          \ {}).get('conditions'):\n                for condition in response['status']['conditions']:\n\
+          \                    print(f\"Condition: {condition}\")\n\n            ready\
+          \ = False\n            if response.get('status', {}).get('conditions'):\n\
+          \                ready = any(\n                    cond.get('type') == 'Ready'\
+          \ and cond.get('status') == 'True'\n                    for cond in response['status']['conditions']\n\
+          \                )\n            if ready:\n                print(\"Service\
+          \ is ready!\")\n                break\n\n            if i < max_retries\
+          \ - 1:\n                print(f\"Service not ready yet, waiting {retry_interval}\
+          \ seconds...\")\n                time.sleep(retry_interval)\n\n        #\
+          \ Get the URL from status\n        url = response.get(\"status\", {}).get(\"\
+          url\", \"URL not available\")\n        print(f\"Service URL: {url}\")\n\n\
+          \        return f\"Model deployed at: {url}\"\n\n    except Exception as\
+          \ e:\n        print(f\"Full error details: {str(e)}\")\n        raise e\n\
+          \n"
+        image: python:3.9
     exec-download-and-split-data:
       container:
         args:
@@ -108,8 +214,8 @@ deploymentSpec:
           \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.7.0'\
           \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"'  &&\
           \  python3 -m pip install --quiet --no-warn-script-location 'tensorflow'\
-          \ 'scikit-learn' 'pandas' 'onnx' 'onnxruntime' 'tf2onnx' && \"$0\" \"$@\"\
-          \n"
+          \ 'scikit-learn' 'pandas' 'onnx' 'onnxruntime' 'tf2onnx' 'mlflow' 'boto3'\
+          \ && \"$0\" \"$@\"\n"
         - sh
         - -ec
         - 'program_path=$(mktemp -d)
@@ -121,82 +227,74 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef train_model(train_data: InputPath(), val_data: InputPath(), model_output:\
-          \ OutputPath()):\n    import pandas as pd\n    import tensorflow as tf\n\
-          \    import numpy as np\n    from sklearn.preprocessing import StandardScaler\n\
-          \    import tf2onnx\n    import onnx\n\n    df_train = pd.read_csv(train_data)\n\
-          \    df_val = pd.read_csv(val_data)\n\n    X_train = df_train.drop(['Class',\
-          \ 'id'], axis=1)\n    y_train = df_train['Class']\n    X_val = df_val.drop(['Class',\
-          \ 'id'], axis=1)\n    y_val = df_val['Class']\n\n    scaler = StandardScaler()\n\
-          \    X_train = scaler.fit_transform(X_train)\n    X_val = scaler.transform(X_val)\n\
-          \n    model = tf.keras.Sequential([\n        tf.keras.layers.Dense(64, activation='relu',\
-          \ input_shape=(29,)),\n        tf.keras.layers.Dropout(0.3),\n        tf.keras.layers.Dense(32,\
-          \ activation='relu'),\n        tf.keras.layers.Dropout(0.2),\n        tf.keras.layers.Dense(16,\
-          \ activation='relu'),\n        tf.keras.layers.Dense(1, activation='sigmoid')\n\
-          \    ])\n\n    model.compile(optimizer='adam', loss='binary_crossentropy',\
-          \ metrics=['accuracy'])\n\n    class_weights = {0: 1, 1: len(y_train[y_train==0])/len(y_train[y_train==1])}\n\
-          \n    model.fit(X_train, y_train, epochs=3, validation_data=(X_val, y_val),\
-          \ class_weight=class_weights)\n\n    # # Before conversion, set the output\
-          \ names\n    # model.outputs[0]._name = 'output_name'  # Give your output\
-          \ a unique name\n\n    # model_proto, _ = tf2onnx.convert.from_keras(model)\n\
-          \    # Convert the Keras model to ONNX\n    import tensorflow as tf\n  \
-          \  import tf2onnx\n    import onnx\n    import os\n\n    # Wrap the model\
-          \ in a tf.function\n    @tf.function(input_signature=[tf.TensorSpec([None,\
-          \ X_train.shape[1]], tf.float32, name='dense_input')])\n    def model_fn(x):\n\
-          \        return model(x)\n\n    # Convert the Keras model to ONNX\n    model_proto,\
-          \ external_tensor_storage = tf2onnx.convert.from_function(\n        model_fn,\n\
-          \        input_signature=[tf.TensorSpec([None, X_train.shape[1]], tf.float32,\
-          \ name='dense_input')],\n        opset=13  # You can specify the ONNX opset\
-          \ version here\n    )\n\n    onnx.save(model_proto, model_output)\n\n"
-        image: python:3.9
-    exec-upload-to-minio:
-      container:
-        args:
-        - --executor_input
-        - '{{$}}'
-        - --function_to_execute
-        - upload_to_minio
-        command:
-        - sh
-        - -c
-        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
-          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
-          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.7.0'\
-          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"'  &&\
-          \  python3 -m pip install --quiet --no-warn-script-location 'boto3' && \"\
-          $0\" \"$@\"\n"
-        - sh
-        - -ec
-        - 'program_path=$(mktemp -d)
-
-
-          printf "%s" "$0" > "$program_path/ephemeral_component.py"
-
-          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
-
-          '
-        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef upload_to_minio(\n    model_path: InputPath(),\n    minio_endpoint:\
-          \ str,\n    minio_access_key: str,\n    minio_secret_key: str\n) -> str:\
-          \  # Change to return string instead of using Output parameter\n    import\
-          \ boto3\n    import os\n    from botocore.client import Config\n\n    #\
-          \ Clean the endpoint URL\n    minio_endpoint = minio_endpoint.strip()\n\n\
-          \    # Create S3 client with explicit credentials\n    s3_client = boto3.client(\n\
-          \        's3',\n        endpoint_url=minio_endpoint,\n        aws_access_key_id=minio_access_key,\n\
-          \        aws_secret_access_key=minio_secret_key,\n        config=Config(\n\
-          \            signature_version='s3v4',\n            s3={'addressing_style':\
-          \ 'path'}\n        )\n    )\n\n    bucket_name = 'mlflow'  # Or your bucket\
-          \ name\n    object_name = 'models/fraud/1/model.onnx'\n\n    print(f\"Uploading\
-          \ {model_path} to {bucket_name}/{object_name}\")\n\n    # Upload the file\n\
-          \    s3_client.upload_file(\n        Filename=model_path,\n        Bucket=bucket_name,\n\
-          \        Key=object_name\n    )\n\n    # Return the MinIO URL\n    return\
-          \ f\"{minio_endpoint}/{bucket_name}/{object_name}\"\n\n"
+          \ *\n\ndef train_model(\n    train_data: InputPath(), \n    val_data: InputPath(),\
+          \ \n    model_output: OutputPath(),\n    mlflow_tracking_uri: str,\n   \
+          \ minio_endpoint: str,\n    aws_access_key_id: str,\n    aws_secret_access_key:\
+          \ str,\n):\n    import pandas as pd\n    import tensorflow as tf\n    import\
+          \ numpy as np\n    from sklearn.preprocessing import StandardScaler\n  \
+          \  import tf2onnx\n    import onnx\n    import mlflow\n    import os\n\n\
+          \    # Set MLflow tracking URI\n    mlflow.set_tracking_uri(mlflow_tracking_uri)\n\
+          \n    # Configure MLflow for MinIO\n    os.environ['MLFLOW_S3_ENDPOINT_URL']\
+          \ = minio_endpoint\n    os.environ['AWS_ACCESS_KEY_ID'] = aws_access_key_id\n\
+          \    os.environ['AWS_SECRET_ACCESS_KEY'] = aws_secret_access_key\n\n   \
+          \ # Start MLflow run\n    with mlflow.start_run(run_name=\"fraud_detection_training\"\
+          ) as run:\n        df_train = pd.read_csv(train_data)\n        df_val =\
+          \ pd.read_csv(val_data)\n\n        X_train = df_train.drop(['Class', 'id'],\
+          \ axis=1)\n        y_train = df_train['Class']\n        X_val = df_val.drop(['Class',\
+          \ 'id'], axis=1)\n        y_val = df_val['Class']\n\n        scaler = StandardScaler()\n\
+          \        X_train = scaler.fit_transform(X_train)\n        X_val = scaler.transform(X_val)\n\
+          \n        # Create a sample input for model signature\n        input_example\
+          \ = X_train[0:1]\n\n        model = tf.keras.Sequential([\n            tf.keras.layers.Dense(64,\
+          \ activation='relu', input_shape=(29,)),\n            tf.keras.layers.Dropout(0.3),\n\
+          \            tf.keras.layers.Dense(32, activation='relu'),\n           \
+          \ tf.keras.layers.Dropout(0.2),\n            tf.keras.layers.Dense(16, activation='relu'),\n\
+          \            tf.keras.layers.Dense(1, activation='sigmoid')\n        ])\n\
+          \n        model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])\n\
+          \n        class_weights = {0: 1, 1: len(y_train[y_train==0])/len(y_train[y_train==1])}\n\
+          \n        history = model.fit(\n            X_train, y_train,\n        \
+          \    epochs=3,\n            validation_data=(X_val, y_val),\n          \
+          \  class_weight=class_weights\n        )\n\n        # Log parameters and\
+          \ metrics\n        mlflow.log_param(\"epochs\", 3)\n        mlflow.log_param(\"\
+          batch_size\", 32)\n        mlflow.log_param(\"optimizer\", \"adam\")\n\n\
+          \        for epoch, metrics in enumerate(history.history['val_accuracy']):\n\
+          \            mlflow.log_metric(\"val_accuracy\", metrics, step=epoch)\n\
+          \            mlflow.log_metric(\"train_accuracy\", history.history['accuracy'][epoch],\
+          \ step=epoch)\n            mlflow.log_metric(\"val_loss\", history.history['val_loss'][epoch],\
+          \ step=epoch)\n            mlflow.log_metric(\"train_loss\", history.history['loss'][epoch],\
+          \ step=epoch)\n\n        # Log model with input example\n        mlflow.tensorflow.log_model(\n\
+          \            model,\n            \"model\",\n            registered_model_name=\"\
+          fraud_detection_model\",\n            input_example=input_example  # Add\
+          \ input example for signature\n        )\n        # Log model with input\
+          \ example\n        mlflow.tensorflow.log_model(\n            model,\n  \
+          \          \"model\",\n            registered_model_name=\"fraud_detection_model\"\
+          ,\n            input_example=input_example\n        )\n\n"
         image: python:3.9
 pipelineInfo:
   name: fraud-detection-pipeline
 root:
   dag:
     tasks:
+      deploy-model-kserve:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-deploy-model-kserve
+        inputs:
+          parameters:
+            aws_access_key_id:
+              runtimeValue:
+                constant: minio
+            aws_secret_access_key:
+              runtimeValue:
+                constant: toto1234
+            minio_endpoint:
+              runtimeValue:
+                constant: http://minio.kubeflow:9000
+            mlflow_tracking_uri:
+              runtimeValue:
+                constant: http://mlflow-server.kubeflow.svc.cluster.local:5000
+        taskInfo:
+          name: deploy-model-kserve
       download-and-split-data:
         cachingOptions:
           enableCache: true
@@ -221,32 +319,26 @@ root:
               taskOutputArtifact:
                 outputArtifactKey: output_val
                 producerTask: download-and-split-data
-        taskInfo:
-          name: train-model
-      upload-to-minio:
-        cachingOptions:
-          enableCache: true
-        componentRef:
-          name: comp-upload-to-minio
-        dependentTasks:
-        - train-model
-        inputs:
-          artifacts:
-            model_path:
-              taskOutputArtifact:
-                outputArtifactKey: model_output
-                producerTask: train-model
           parameters:
-            minio_access_key:
+            aws_access_key_id:
               runtimeValue:
-                constant: admin1234
+                constant: minio
+            aws_secret_access_key:
+              runtimeValue:
+                constant: toto1234
             minio_endpoint:
               runtimeValue:
-                constant: http://minio.kubeflow.svc.cluster.local:9000
-            minio_secret_key:
+                constant: http://minio.kubeflow:9000
+            mlflow_tracking_uri:
               runtimeValue:
-                constant: admin1234
+                constant: http://mlflow-server.kubeflow.svc.cluster.local:5000
         taskInfo:
-          name: upload-to-minio
+          name: train-model
+  inputDefinitions:
+    parameters:
+      accuracy_threshold:
+        defaultValue: 0.9
+        isOptional: true
+        parameterType: NUMBER_DOUBLE
 schemaVersion: 2.1.0
 sdkVersion: kfp-2.7.0
