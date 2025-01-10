@@ -1,0 +1,107 @@
+---
+- name: Install Terraform, MicroK8s, Kubectl, and Juju
+  hosts: localhost
+  become: yes
+
+  tasks:
+    - name: Install Terraform snap
+      community.general.snap:
+        name: terraform
+        classic: yes
+        state: present
+
+    - name: Install kubectl snap
+      community.general.snap:
+        name: kubectl
+        classic: yes
+        state: present
+
+    - name: Install MicroK8s snap
+      community.general.snap:
+        name: microk8s
+        classic: yes
+        state: present
+        channel: "1.29/stable"  # Specify the channel here
+
+    - name: Wait for MicroK8s to be ready
+      wait_for:
+        timeout: 30
+
+    - name: Add ubuntu user to microk8s group
+      user:
+        name: ubuntu
+        groups: microk8s
+        append: yes
+
+    - name: Create .kube directory
+      file:
+        path: /home/ubuntu/.kube
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+
+    - name: Reload group membership
+      shell: newgrp microk8s
+      become_user: ubuntu
+
+    - name: Enable MicroK8s add-ons
+      shell: |
+        microk8s enable dns
+        microk8s enable metallb:10.64.140.43-10.64.140.49
+        microk8s enable storage
+        microk8s enable rbac
+      become: yes
+
+    - name: Wait for add-ons to be ready
+      wait_for:
+        timeout: 60
+
+    - name: Generate kubeconfig file
+      shell: microk8s config > /home/ubuntu/.kube/config
+      become: yes
+
+    - name: Set correct ownership for kubeconfig
+      file:
+        path: /home/ubuntu/.kube/config
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+
+    - name: Install Juju snap
+      community.general.snap:
+        name: juju
+        classic: no
+        state: present
+        channel: "3.4/stable"  # Specify the channel here
+
+    - name: Create Juju credentials directory
+      file:
+        path: /var/snap/juju/current/microk8s/credentials
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+
+    - name: Copy kubeconfig to Juju's credentials directory
+      shell: |
+        microk8s config | sudo tee /var/snap/juju/current/microk8s/credentials/client.config
+      become: yes
+
+    - name: Set ownership for Juju credentials directory
+      file:
+        path: /var/snap/juju/current/microk8s/credentials
+        owner: ubuntu
+        group: ubuntu
+        recurse: yes
+
+    - name: Bootstrap Juju on MicroK8s
+      shell: |
+        juju bootstrap microk8s
+      become_user: ubuntu
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+
+    - name: Wait for Juju to be ready
+      wait_for:
+        timeout: 60
